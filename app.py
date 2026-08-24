@@ -77,7 +77,8 @@ async def init_db(db: asyncpg.Pool) -> None:
                 status TEXT NOT NULL DEFAULT 'pending',
                 created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
                 processed_at TIMESTAMPTZ,
-                reject_reason TEXT
+                reject_reason TEXT,
+                paypay_name TEXT
             );
 
             CREATE TABLE IF NOT EXISTS entry_links (
@@ -88,6 +89,9 @@ async def init_db(db: asyncpg.Pool) -> None:
                 used BOOLEAN NOT NULL DEFAULT FALSE,
                 created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
             );
+
+            ALTER TABLE payment_requests
+            ADD COLUMN IF NOT EXISTS paypay_name TEXT;
 
             CREATE INDEX IF NOT EXISTS idx_payment_requests_status
             ON payment_requests(status);
@@ -185,7 +189,48 @@ async def payment_done(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
             """,
             update.effective_user.id,
         )
+
+    if pending:
+        await update.effective_message.reply_text(
+            "すでに入金確認待ちです。管理者の確認をお待ちください。",
+            reply_markup=MENU,
+        )
+        return
+
+    context.user_data["awaiting_paypay_name"] = True
+    await update.effective_message.reply_text(
+        "💳 PayPayで送金したときの「送金者名」を入力してください。\n\n"
+        "例：山田 太郎\n"
+        "※ PayPayの入金履歴に表示される名前をそのまま入力してください。"
+    )
+
+
+async def submit_payment_request(
+    update: Update,
+    context: ContextTypes.DEFAULT_TYPE,
+    paypay_name: str,
+) -> None:
+    assert pool is not None
+
+    paypay_name = paypay_name.strip()
+    if not paypay_name:
+        await update.effective_message.reply_text(
+            "PayPay名を入力してください。"
+        )
+        return
+
+    async with pool.acquire() as conn:
+        pending = await conn.fetchval(
+            """
+            SELECT EXISTS(
+                SELECT 1 FROM payment_requests
+                WHERE telegram_id=$1 AND status='pending'
+            )
+            """,
+            update.effective_user.id,
+        )
         if pending:
+            context.user_data.pop("awaiting_paypay_name", None)
             await update.effective_message.reply_text(
                 "すでに入金確認待ちです。管理者の確認をお待ちください。",
                 reply_markup=MENU,
@@ -194,13 +239,16 @@ async def payment_done(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
 
         request_id = await conn.fetchval(
             """
-            INSERT INTO payment_requests(telegram_id, amount)
-            VALUES($1,$2)
+            INSERT INTO payment_requests(telegram_id, amount, paypay_name)
+            VALUES($1,$2,$3)
             RETURNING id
             """,
             update.effective_user.id,
             MEMBERSHIP_FEE,
+            paypay_name,
         )
+
+    context.user_data.pop("awaiting_paypay_name", None)
 
     username = (
         f"@{update.effective_user.username}"
@@ -209,8 +257,9 @@ async def payment_done(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
     )
 
     await update.effective_message.reply_text(
-        "✅ 入金完了メッセージを送信しました。\n\n"
+        "✅ 入金確認申請を送信しました。\n\n"
         f"申請番号：{request_id}\n"
+        f"PayPay名：{paypay_name}\n"
         "管理者がPayPay入金履歴を確認します。",
         reply_markup=MENU,
     )
@@ -223,6 +272,7 @@ async def payment_done(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
             f"会員名：{update.effective_user.first_name}\n"
             f"ユーザー名：{username}\n"
             f"Telegram ID：{update.effective_user.id}\n"
+            f"PayPay名：{paypay_name}\n"
             f"金額：{yen(MEMBERSHIP_FEE)}\n\n"
             "下のボタンから承認・却下できます。",
             reply_markup=InlineKeyboardMarkup([[
@@ -345,6 +395,15 @@ async def join_request(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
 
 async def text_router(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     text = update.effective_message.text or ""
+
+    if context.user_data.get("awaiting_paypay_name"):
+        if text in {"💳 PayPayで支払う", "✅ 入金完了", "🚪 グループへ入室する", "🔄 承認状況を確認"}:
+            await update.effective_message.reply_text(
+                "先にPayPayの送金者名を入力してください。"
+            )
+            return
+        await submit_payment_request(update, context, text)
+        return
 
     if text == "💳 PayPayで支払う":
         await show_qr(update, context)
@@ -640,6 +699,7 @@ async def dashboard(request: Request):
               <td>{item['id']}</td>
               <td>{escape(item['first_name'] or '')}<br>@{escape(item['username'] or 'なし')}</td>
               <td>{item['telegram_id']}</td>
+              <td>{escape(item['paypay_name'] or '未記載')}</td>
               <td>{yen(item['amount'])}</td>
               <td>{escape(item['status'])}</td>
               <td>{item['created_at'].strftime('%Y-%m-%d %H:%M')}</td>
@@ -661,7 +721,7 @@ async def dashboard(request: Request):
         <thead>
           <tr>
             <th>ID</th><th>会員</th><th>Telegram ID</th>
-            <th>金額</th><th>状態</th><th>申請日時</th><th>操作</th>
+            <th>PayPay名</th><th>金額</th><th>状態</th><th>申請日時</th><th>操作</th>
           </tr>
         </thead>
         <tbody>{''.join(rows)}</tbody>
