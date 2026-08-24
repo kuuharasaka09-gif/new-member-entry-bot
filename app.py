@@ -10,9 +10,10 @@ from fastapi import FastAPI, Form, Request
 from fastapi.responses import HTMLResponse, RedirectResponse
 from fastapi.staticfiles import StaticFiles
 from starlette.middleware.sessions import SessionMiddleware
-from telegram import ChatJoinRequest, ReplyKeyboardMarkup, Update
+from telegram import ChatJoinRequest, InlineKeyboardButton, InlineKeyboardMarkup, ReplyKeyboardMarkup, Update
 from telegram.ext import (
     Application,
+    CallbackQueryHandler,
     ChatJoinRequestHandler,
     CommandHandler,
     ContextTypes,
@@ -223,7 +224,11 @@ async def payment_done(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
             f"ユーザー名：{username}\n"
             f"Telegram ID：{update.effective_user.id}\n"
             f"金額：{yen(MEMBERSHIP_FEE)}\n\n"
-            "Web管理画面から承認してください。",
+            "下のボタンから承認・却下できます。",
+            reply_markup=InlineKeyboardMarkup([[
+                InlineKeyboardButton("✅ 承認", callback_data=f"approve:{request_id}"),
+                InlineKeyboardButton("❌ 却下", callback_data=f"reject:{request_id}"),
+            ]]),
         )
     except Exception:
         logger.exception("管理者通知に失敗しました")
@@ -438,6 +443,26 @@ async def reject_request(request_id: int, reason: str) -> tuple[bool, str]:
     return True, "否認しました。"
 
 
+
+async def admin_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    query = update.callback_query
+    if query is None:
+        return
+    if query.from_user.id != ADMIN_ID:
+        await query.answer("管理者のみ操作できます。", show_alert=True)
+        return
+    await query.answer()
+    action, request_id_text = query.data.split(":", 1)
+    request_id = int(request_id_text)
+    if action == "approve":
+        ok, message = await approve_request(request_id)
+        prefix = "✅" if ok else "⚠️"
+    else:
+        ok, message = await reject_request(request_id, "管理者がTelegram Botから却下")
+        prefix = "❌" if ok else "⚠️"
+    await query.edit_message_reply_markup(reply_markup=None)
+    await query.message.reply_text(f"{prefix} 申請番号 {request_id}：{message}")
+
 def logged_in(request: Request) -> bool:
     return request.session.get("admin") is True
 
@@ -487,6 +512,7 @@ async def lifespan(_: FastAPI):
 
     telegram_app = Application.builder().token(BOT_TOKEN).build()
     telegram_app.add_handler(CommandHandler("start", start))
+    telegram_app.add_handler(CallbackQueryHandler(admin_callback, pattern=r"^(approve|reject):\d+$"))
     telegram_app.add_handler(ChatJoinRequestHandler(join_request))
     telegram_app.add_handler(
         MessageHandler(filters.TEXT & ~filters.COMMAND, text_router)
